@@ -18,12 +18,29 @@
 
 #include "gloo/transport/device.h"
 
+#include "gloo/common/error.h"
+
 namespace gloo {
 namespace transport {
 namespace tcp {
 
 struct attr {
-  attr() {}
+  attr() {
+    // HACK: Check for a port range from the environment.
+    char *portRange = getenv("GLOO_PORT_RANGE");
+    usePortRange = false;
+    if (portRange != NULL) {
+      int ret = sscanf(portRange, "%hu:%hu", &portMin, &portMax);
+      if (ret == 2 && portMax >= portMin) {
+        usePortRange = true;
+      } else {
+        GLOO_THROW_INVALID_OPERATION_EXCEPTION("invalid GLOO_PORT_RANGE: ", portRange);
+//        signalAndThrowException(
+//            GLOO_ERROR_MSG("invalid GLOO_PORT_RANGE: ", portRange));
+      }
+    }
+  }
+
   /* implicit */ attr(const char* ptr) : hostname(ptr) {}
 
   std::string hostname;
@@ -37,6 +54,11 @@ struct attr {
   int ai_protocol;
   struct sockaddr_storage ai_addr;
   int ai_addrlen;
+
+  // For automatically picking ports within a certain range.
+  bool usePortRange = false;
+  unsigned short portMin;
+  unsigned short portMax;
 };
 
 std::shared_ptr<::gloo::transport::Device> CreateDevice(
