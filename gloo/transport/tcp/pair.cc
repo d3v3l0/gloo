@@ -47,6 +47,26 @@ constexpr size_t kMaxRecvBufferSize = 32 * 1024 * 1024;
 
 } // namespace
 
+// Wraps bind but also sets the port to a value.
+static inline int bindToPort(
+    int fd,
+    const struct attr &attr,
+    unsigned short port) {
+  // Make a copy before setting the port.
+  struct sockaddr_storage portAddr;
+  memcpy(&portAddr, &attr.ai_addr, attr.ai_addrlen);
+
+  if (attr.ai_family == AF_INET) {
+    ((struct sockaddr_in*)&portAddr)->sin_port = htons(port);
+  } else if (attr.ai_family == AF_INET6) {
+    ((struct sockaddr_in6*)&portAddr)->sin6_port = htons(port);
+  } else {
+    GLOO_THROW_INVALID_OPERATION_EXCEPTION("unknown sa_family");
+  }
+
+  return bind(fd, (struct sockaddr*)&portAddr, attr.ai_addrlen);
+}
+
 Pair::Pair(
     Context* context,
     Device* device,
@@ -154,25 +174,64 @@ void Pair::setSync(bool sync, bool busyPoll) {
 void Pair::listen() {
   std::lock_guard<std::mutex> lock(m_);
   int rv;
+  int fd;
 
   const auto& attr = device_->attr_;
-  auto fd = socket(attr.ai_family, attr.ai_socktype, attr.ai_protocol);
-  if (fd == -1) {
-    signalAndThrowException(GLOO_ERROR_MSG("socket: ", strerror(errno)));
-  }
 
-  // Set SO_REUSEADDR to signal that reuse of the listening port is OK.
-  int on = 1;
-  rv = setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
-  if (rv == -1) {
-    ::close(fd);
-    signalAndThrowException(GLOO_ERROR_MSG("setsockopt: ", strerror(errno)));
-  }
+  if (attr.usePortRange) {
+    // Find a port in the specified port range.
+    bool foundPort = false;
+    for (size_t i = attr.portMin; i <= attr.portMax; i++) {
+      fd = socket(attr.ai_family, attr.ai_socktype, attr.ai_protocol);
+      if (fd == -1) {
+        signalAndThrowException(GLOO_ERROR_MSG("socket: ", strerror(errno)));
+      }
 
-  rv = bind(fd, (const sockaddr*)&attr.ai_addr, attr.ai_addrlen);
-  if (rv == -1) {
-    ::close(fd);
-    signalAndThrowException(GLOO_ERROR_MSG("bind: ", strerror(errno)));
+      // Set SO_REUSEADDR to signal that reuse of the listening port is OK.
+      int on = 1;
+      rv = setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+      if (rv == -1) {
+        ::close(fd);
+        signalAndThrowException(GLOO_ERROR_MSG("setsockopt: ", strerror(errno)));
+      }
+
+      rv = bindToPort(fd, attr, (unsigned short)i);
+      if (rv == -1 && errno == EADDRINUSE) {
+        // Tolerate EADDRINUSE; close the socket and retry.
+        ::close(fd);
+        continue;
+      } else if (rv == -1) {
+        signalAndThrowException(GLOO_ERROR_MSG("bind: ", strerror(errno)));
+      }
+
+      // Found a port, exit the loop.
+      foundPort = true;
+      break;
+    }
+
+    // Verify that we found a port.
+    GLOO_ENFORCE(foundPort == true, "Unable to find open port");
+
+  } else {
+    // Bind to any port.
+    fd = socket(attr.ai_family, attr.ai_socktype, attr.ai_protocol);
+    if (fd == -1) {
+      signalAndThrowException(GLOO_ERROR_MSG("socket: ", strerror(errno)));
+    }
+
+    // Set SO_REUSEADDR to signal that reuse of the listening port is OK.
+    int on = 1;
+    rv = setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+    if (rv == -1) {
+      ::close(fd);
+      signalAndThrowException(GLOO_ERROR_MSG("setsockopt: ", strerror(errno)));
+    }
+
+    rv = bind(fd, (struct sockaddr*)&attr.ai_addr, attr.ai_addrlen);
+    if (rv == -1) {
+      ::close(fd);
+      signalAndThrowException(GLOO_ERROR_MSG("bind: ", strerror(errno)));
+    }
   }
 
   // listen(2) on socket
